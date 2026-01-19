@@ -28,6 +28,5 @@ set(LLEXT_APPEND_FLAGS ${LLEXT_APPEND_FLAGS}
 else()
 set(LLEXT_APPEND_FLAGS ${LLEXT_APPEND_FLAGS}
   -ffreestanding
-  -mno-generate-flix
 )
 endif()
