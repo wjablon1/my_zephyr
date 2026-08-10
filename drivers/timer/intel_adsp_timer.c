@@ -58,18 +58,74 @@ static uint64_t last_count;
 const int32_t z_sys_timer_irq_for_test = TIMER_IRQ; /* See tests/kernel/context */
 #endif
 
+static uint64_t count(void);
+
+/* DSPWCTCS.TxA is write-1-to-set and is cleared by hardware only on a compare
+ * match - it cannot be disarmed in software, so the compare value is always
+ * reprogrammed while still armed. Per erratum HSD 18038820785 that is unsafe
+ * on ACE: DSPWCTxC and the comparison logic sit in different asynchronous
+ * clock domains, so a partially latched value can produce a spurious,
+ * premature match. Guard against it the way the reference ACE firmware does
+ * (wallclock_ace.c: adsphal_wallclock_compare_set()): keep the high dword
+ * parked at a value the counter cannot reach across every intermediate
+ * write, letting each one settle in the wall clock domain, and only commit
+ * the real high word last.
+ */
+#define DSPWCT_PARK_HI 0xF0000000UL
+
+/* DSPWCTCS bits 7:0 hold the write-1-to-set arm bits (TxA) and the
+ * write-1-to-clear triggered bits (TxT). Zero them on every read-modify-write
+ * so no bit is armed or cleared as a side effect of updating another one
+ * (e.g. a foreign comparator's still-set TxT read back and blindly written
+ * would silently clear that comparator's trigger).
+ */
+#define DSPWCTCS_RMW_MASK 0xFFFFFF00UL
+
+static void dspwctcs_update(uint32_t bits)
+{
+	sys_write32((sys_read32(DSPWCTCS_ADDR) & DSPWCTCS_RMW_MASK) | bits, DSPWCTCS_ADDR);
+}
+
+static void wait_wallclock_cycles(uint32_t cycles)
+{
+	uint64_t start = count();
+
+	while ((count() - start) <= cycles) {
+		;
+	}
+}
+
+/* Some platforms/conditions (observed after a SOFT_OFF/D3 restore) have MMIO
+ * round-trip latency for the disarm/write/arm sequence below that exceeds a
+ * full CYC_PER_TICK, so a statically-computed "next" compare can already be
+ * in the past by the time the arm write takes hardware effect. Verify the
+ * arm actually landed in the future and retry from a fresh reading if not,
+ * rather than trusting a fixed margin - otherwise the comparator fires
+ * immediately, and each retriggered ISR can repeat the same mistake forever
+ * (a livelock where the timer preempts everything else, indefinitely).
+ */
 static void set_compare(uint64_t time)
 {
-	/* Disarm the comparator to prevent spurious triggers */
-	sys_write32(sys_read32(DSPWCTCS_ADDR) & (~DSP_WCT_CS_TA(COMPARATOR_IDX)),
-			SYSCON_REG_ADDR + ADSP_DSPWCTCS_OFFSET);
+	bool expired;
 
-	sys_write32((uint32_t)time, DSPWCT0C_LO_ADDR);
-	sys_write32((uint32_t)(time >> 32), DSPWCT0C_HI_ADDR);
+	do {
+		sys_write32(sys_read32(DSPWCT0C_HI_ADDR) | DSPWCT_PARK_HI, DSPWCT0C_HI_ADDR);
+		wait_wallclock_cycles(2);
+		sys_write32((uint32_t)time, DSPWCT0C_LO_ADDR);
+		sys_write32(((uint32_t)(time >> 32)) | DSPWCT_PARK_HI, DSPWCT0C_HI_ADDR);
+		wait_wallclock_cycles(2);
+		sys_write32((uint32_t)(time >> 32), DSPWCT0C_HI_ADDR);
 
-	/* Arm the timer */
-	sys_write32(sys_read32(DSPWCTCS_ADDR) | (DSP_WCT_CS_TA(COMPARATOR_IDX)),
-			DSPWCTCS_ADDR);
+		/* Arm the timer */
+		dspwctcs_update(DSP_WCT_CS_TA(COMPARATOR_IDX));
+
+		uint64_t now = count();
+
+		expired = now >= time;
+		if (expired) {
+			time = now + CYC_PER_TICK;
+		}
+	} while (expired);
 }
 
 static uint64_t count(void)
@@ -110,8 +166,7 @@ static void compare_isr(const void *arg)
 	dticks = (curr - last_count) / CYC_PER_TICK;
 
 	/* Clear the triggered bit */
-	sys_write32(sys_read32(DSPWCTCS_ADDR) | DSP_WCT_CS_TT(COMPARATOR_IDX),
-			DSPWCTCS_ADDR);
+	dspwctcs_update(DSP_WCT_CS_TT(COMPARATOR_IDX));
 
 	last_count += dticks * CYC_PER_TICK;
 
@@ -147,6 +202,11 @@ void sys_clock_set_timeout(uint32_t ticks, bool idle)
 	} else {
 		cyc = MAX_CYC;
 	}
+
+	if (cyc > MAX_CYC - (uint32_t)last_count) {
+		cyc = MAX_CYC - (uint32_t)last_count;
+	}
+
 	cyc = (cyc / CYC_PER_TICK) * CYC_PER_TICK;
 	next = last_count + cyc;
 
@@ -195,8 +255,11 @@ static void irq_init(void)
 	 */
 #ifdef CONFIG_SOC_SERIES_INTEL_ADSP_ACE
 	ACE_DINT[cpu].ie[ACE_INTL_TTS] |= BIT(COMPARATOR_IDX + 1);
-	sys_write32(sys_read32(DSPWCTCS_ADDR) | ADSP_SHIM_DSPWCTCS_TTIE(COMPARATOR_IDX),
-			DSPWCTCS_ADDR);
+	/* Discard any trigger latched before this core was (re)started, e.g.
+	 * a stale one surviving a D3 power-down, before unmasking the source.
+	 */
+	dspwctcs_update(DSP_WCT_CS_TT(COMPARATOR_IDX));
+	dspwctcs_update(ADSP_SHIM_DSPWCTCS_TTIE(COMPARATOR_IDX));
 #else
 	CAVS_INTCTRL[cpu].l2.clear = CAVS_L2_DWCT0;
 #endif
